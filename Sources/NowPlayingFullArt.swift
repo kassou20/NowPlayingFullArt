@@ -46,31 +46,40 @@ private final class ArtworkComposer {
     /// Builds a 3:4 portrait from a square cover: blurred + dimmed background
     /// with the original cover centered on top.
     static func compose(cover: UIImage, outputSize: CGSize) -> UIImage? {
-        let renderer = UIGraphicsImageRenderer(size: outputSize)
-        return renderer.image { ctx in
-            let rect = CGRect(origin: .zero, size: outputSize)
+        let rect = CGRect(origin: .zero, size: outputSize)
 
-            // 1. Draw cover stretched to fill the whole 3:4 canvas (will be blurred)
-            cover.draw(in: rect)
+        // 1. Pre-render the stretched cover for blur input (separate context)
+        let stretchRenderer = UIGraphicsImageRenderer(size: outputSize)
+        let stretched = stretchRenderer.image { _ in cover.draw(in: rect) }
 
-            // 2. Apply gaussian blur via CIFilter
-            if let ciImage = CIImage(image: renderer.image { c in cover.draw(in: rect) }),
-               let blur = CIFilter(name: "CIGaussianBlur", parameters: [
-                   kCIInputImageKey: ciImage,
-                   kCIInputRadiusKey: 40
-               ]),
-               let output = blur.outputImage {
-                let ciCtx = CIContext()
-                if let cgBlurred = ciCtx.createCGImage(output, from: ciImage.extent) {
-                    UIImage(cgImage: cgBlurred).draw(in: rect)
-                }
+        // 2. Apply gaussian blur via CIFilter
+        guard let ciImage = CIImage(image: stretched) else { return nil }
+        let blurredImage: UIImage
+        if let blur = CIFilter(name: "CIGaussianBlur", parameters: [
+               kCIInputImageKey: ciImage,
+               kCIInputRadiusKey: 40
+           ]),
+           let output = blur.outputImage {
+            let ciCtx = CIContext()
+            if let cgBlurred = ciCtx.createCGImage(output, from: ciImage.extent) {
+                blurredImage = UIImage(cgImage: cgBlurred)
+            } else {
+                blurredImage = stretched
             }
+        } else {
+            blurredImage = stretched
+        }
 
-            // 3. Dim overlay so the foreground pops
+        // 3. Composite: blurred bg → dim overlay → centered cover
+        let compositeRenderer = UIGraphicsImageRenderer(size: outputSize)
+        return compositeRenderer.image { ctx in
+            blurredImage.draw(in: rect)
+
+            // Dim overlay so the foreground pops
             UIColor.black.withAlphaComponent(0.3).setFill()
             ctx.fill(rect)
 
-            // 4. Center the original cover, scaled to fit width with padding
+            // Center the original cover, scaled to fit width with padding
             let padding: CGFloat = outputSize.width * 0.05
             let coverWidth = outputSize.width - padding * 2
             let coverHeight = coverWidth // square
