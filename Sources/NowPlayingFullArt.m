@@ -695,19 +695,17 @@ static BOOL resolvePropertyKeys(void) {
         return NO;
     }
 
-    NSString **ptr3x4 = (NSString **)dlsym(handle,
-        "MPNowPlayingInfoProperty3x4AnimatedArtwork");
-    if (ptr3x4 && *ptr3x4) {
-        sKey3x4 = *ptr3x4;
+    void *sym3x4 = dlsym(handle, "MPNowPlayingInfoProperty3x4AnimatedArtwork");
+    if (sym3x4) {
+        sKey3x4 = *(__unsafe_unretained NSString **)sym3x4;
         NPFLog(@"Resolved key3x4: %@", sKey3x4);
     } else {
         NPFLog(@"MPNowPlayingInfoProperty3x4AnimatedArtwork not found in framework");
     }
 
-    NSString **ptr1x1 = (NSString **)dlsym(handle,
-        "MPNowPlayingInfoProperty1x1AnimatedArtwork");
-    if (ptr1x1 && *ptr1x1) {
-        sKey1x1 = *ptr1x1;
+    void *sym1x1 = dlsym(handle, "MPNowPlayingInfoProperty1x1AnimatedArtwork");
+    if (sym1x1) {
+        sKey1x1 = *(__unsafe_unretained NSString **)sym1x1;
         NPFLog(@"Resolved key1x1: %@", sKey1x1);
     } else {
         NPFLog(@"MPNowPlayingInfoProperty1x1AnimatedArtwork not found in framework");
