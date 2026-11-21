@@ -236,8 +236,8 @@ static BOOL drawFrame(CGImageRef image, CVPixelBufferRef pixelBuffer,
     CGFloat width = size.width * (CGFloat)zoom;
     CGFloat height = size.height * (CGFloat)zoom;
 
-    CGContextTranslateCTM(context, 0, size.height);
-    CGContextScaleCTM(context, 1, -1);
+    // No Y-flip needed: CGBitmapContext is bottom-up, CVPixelBuffer is top-down,
+    // so the natural mismatch correctly displays a UIKit-originated CGImage.
     CGContextSetInterpolationQuality(context, kCGInterpolationHigh);
     CGContextDrawImage(context, CGRectMake(
         (size.width - width) / 2.0,
