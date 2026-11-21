@@ -24,7 +24,10 @@ echo "Checking for MPMediaItemAnimatedArtwork..."
 PROBE=$(mktemp /tmp/npa_probe.XXXXXX.swift)
 cat > "$PROBE" <<'EOF'
 import MediaPlayer
-let _ = MPMediaItemAnimatedArtwork.self
+// Class is @available(iOS 19.0, *) — wrap in availability check for the probe
+if #available(iOS 19.0, *) {
+    let _ = MPMediaItemAnimatedArtwork.self
+}
 EOF
 if ! swiftc -typecheck -sdk "$SDK" -target "$TARGET" "$PROBE" 2>/dev/null; then
     echo "ERROR: This SDK does not have MPMediaItemAnimatedArtwork."
