@@ -30,6 +30,8 @@ xcrun clang -arch arm64 -isysroot "$SDK" \
     -framework AVFoundation \
     -framework CoreMedia \
     -framework CoreImage \
+    -framework CoreGraphics \
+    -framework CoreVideo \
     -lobjc \
     -fobjc-arc \
     "$SRC/NowPlayingFullArt.m"
