@@ -1,13 +1,17 @@
 // NowPlayingFullArt — Plexamp edition
-// Hooks MPNowPlayingInfoCenter to inject MPMediaItemAnimatedArtwork so the
-// Lock Screen shows full-bleed album art with Liquid Glass on iOS 26.
 //
-// Architecture:
-//   bootstrap.c  → __attribute__((constructor)) queues npa_bootstrap on main
-//   This file     → npa_bootstrap() swizzles -[MPNowPlayingInfoCenter setNowPlayingInfo:]
-//                   On every call it composites a 3:4 portrait preview, renders a
-//                   short zoom-loop H.264 video, and attaches both via the new
-//                   MPMediaItemAnimatedArtwork API.
+// Full-screen Lock Screen artwork for Plexamp, using the iOS 26 API:
+//
+//   MPNowPlayingInfoProperty3x4AnimatedArtwork  (3:4 portrait == full screen)
+//   MPMediaItemAnimatedArtwork(artworkID:previewImageRequestHandler:
+//                              videoAssetFileURLRequestHandler:)
+//
+// The player is never modified. We only read the nowPlayingInfo dictionary it
+// hands to MediaRemote, and if it has no animated artwork we add our own: a 3:4
+// image composed from the existing cover (blurred fill + centred square art)
+// plus a short, seamlessly looping zoom rendered to a local mp4.
+//
+// Based on chdc0/NPFArt.
 
 import Foundation
 import UIKit
@@ -16,403 +20,408 @@ import AVFoundation
 import CoreImage
 import ObjectiveC
 
-// ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Config
-// ─────────────────────────────────────────────────────────────────────────────
+// MARK: - Configuration
 
-private enum NPAConfig {
-    /// Set false for a cheaper two-frame still that still fills the screen.
+enum NPAConfig {
+    /// Only fill in when the player supplied no animated artwork.
     static let animate        = true
-    /// Length of the zoom loop in seconds.
-    static let loopSeconds    = 3.0
-    /// Zoom amplitude — 0.05 → 5 % scale swing, with zero velocity at the seam.
-    static let zoomAmplitude  = 0.05
-    /// Preview image size (3:4 ratio mandatory — system discards other ratios).
     static let previewSize    = CGSize(width: 900, height: 1200)
-    /// Encoded video size (3:4 ratio mandatory).
     static let videoSize      = CGSize(width: 720, height: 960)
-    /// Video frame rate.
-    static let fps            = 30
-    /// Maximum cached videos on disk before pruning oldest.
-    static let maxCachedFiles = 20
+    static let loopSeconds    = 3.0
+    static let fps: Int32     = 30
+    static let zoomAmplitude: CGFloat = 0.05
+    static let maxCachedVideos  = 60
+    static let maxCachedPreviews = 24
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Artwork Composer (static image → 3:4 portrait)
-// ─────────────────────────────────────────────────────────────────────────────
+// MARK: - 3:4 artwork composition
 
-private final class ArtworkComposer {
+enum ArtworkComposer {
+    private static let ciContext = CIContext(options: [.useSoftwareRenderer: false])
 
-    /// Builds a 3:4 portrait from a square cover: blurred + dimmed background
-    /// with the original cover centered on top.
-    static func compose(cover: UIImage, outputSize: CGSize) -> UIImage? {
-        let rect = CGRect(origin: .zero, size: outputSize)
+    static func compose(_ cover: UIImage, size: CGSize) -> UIImage? {
+        guard let cg = cover.cgImage else { return nil }
 
-        // 1. Pre-render the stretched cover for blur input (separate context)
-        let stretchRenderer = UIGraphicsImageRenderer(size: outputSize)
-        let stretched = stretchRenderer.image { _ in cover.draw(in: rect) }
+        let rect = CGRect(origin: .zero, size: size)
+        let source = CIImage(cgImage: cg)
 
-        // 2. Apply gaussian blur via CIFilter
-        guard let ciImage = CIImage(image: stretched) else { return nil }
-        let blurredImage: UIImage
-        if let blur = CIFilter(name: "CIGaussianBlur", parameters: [
-               kCIInputImageKey: ciImage,
-               kCIInputRadiusKey: 40
-           ]),
-           let output = blur.outputImage {
-            let ciCtx = CIContext()
-            if let cgBlurred = ciCtx.createCGImage(output, from: ciImage.extent) {
-                blurredImage = UIImage(cgImage: cgBlurred)
-            } else {
-                blurredImage = stretched
-            }
-        } else {
-            blurredImage = stretched
-        }
+        let scale = max(size.width / source.extent.width, size.height / source.extent.height)
+        var background = source.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        background = background.transformed(
+            by: CGAffineTransform(
+                translationX: (size.width - background.extent.width) / 2.0,
+                y: (size.height - background.extent.height) / 2.0
+            )
+        )
 
-        // 3. Composite: blurred bg → dim overlay → centered cover
-        let compositeRenderer = UIGraphicsImageRenderer(size: outputSize)
-        return compositeRenderer.image { ctx in
-            blurredImage.draw(in: rect)
+        let radius = max(size.width, size.height) * 0.05
+        let treated = background
+            .clampedToExtent()
+            .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: radius])
+            .cropped(to: rect)
+            .applyingFilter(
+                "CIColorControls",
+                parameters: [
+                    kCIInputBrightnessKey: -0.08,
+                    kCIInputSaturationKey: 1.10,
+                ]
+            )
 
-            // Dim overlay so the foreground pops
-            UIColor.black.withAlphaComponent(0.3).setFill()
-            ctx.fill(rect)
+        guard let backgroundCG = ciContext.createCGImage(treated, from: rect) else { return nil }
 
-            // Center the original cover, scaled to fit width with padding
-            let padding: CGFloat = outputSize.width * 0.05
-            let coverWidth = outputSize.width - padding * 2
-            let coverHeight = coverWidth // square
-            let coverY = (outputSize.height - coverHeight) / 2
-            let coverRect = CGRect(x: padding, y: coverY, width: coverWidth, height: coverHeight)
-            cover.draw(in: coverRect)
+        let format = UIGraphicsImageRendererFormat.default()
+        format.scale = 1
+        format.opaque = true
+
+        return UIGraphicsImageRenderer(size: size, format: format).image { _ in
+            UIImage(cgImage: backgroundCG).draw(in: rect)
+            let side = size.width * 0.92
+            let frame = CGRect(
+                x: (size.width - side) / 2.0,
+                y: (size.height - side) / 2.0,
+                width: side,
+                height: side
+            )
+            cover.draw(in: frame)
         }
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Video Maker (image → H.264 zoom loop)
-// ─────────────────────────────────────────────────────────────────────────────
+// MARK: - Local video rendering
 
-private final class VideoMaker {
-
-    /// Renders a looping zoom video from a portrait image.
-    /// The zoom eases in and out with a cosine wave so the loop seam is invisible.
-    static func render(image: UIImage,
-                       to outputURL: URL,
-                       size: CGSize,
-                       duration: Double,
-                       fps: Int,
-                       amplitude: Double,
-                       completion: @escaping (Bool) -> Void) {
-
-        let totalFrames = Int(duration * Double(fps))
-        guard totalFrames > 0, let cgImage = image.cgImage else {
-            completion(false)
-            return
+enum VideoMaker {
+    static func make(
+        image: UIImage,
+        size: CGSize,
+        url: URL
+    ) async -> Bool {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+            DispatchQueue.global(qos: .utility).async {
+                let ok = renderSync(image: image, size: size, url: url)
+                continuation.resume(returning: ok)
+            }
         }
+    }
 
-        // Clean up previous file
-        try? FileManager.default.removeItem(at: outputURL)
+    private static func renderSync(image: UIImage, size: CGSize, url: URL) -> Bool {
+        guard let cgImage = image.cgImage else { return false }
+        try? FileManager.default.removeItem(at: url)
+        guard let writer = try? AVAssetWriter(outputURL: url, fileType: .mp4) else { return false }
 
-        guard let writer = try? AVAssetWriter(outputURL: outputURL, fileType: .mp4) else {
-            completion(false)
-            return
-        }
-
-        let videoSettings: [String: Any] = [
+        let outputSettings: [String: Any] = [
             AVVideoCodecKey: AVVideoCodecType.h264,
             AVVideoWidthKey: Int(size.width),
             AVVideoHeightKey: Int(size.height),
             AVVideoCompressionPropertiesKey: [
-                AVVideoAverageBitRateKey: 2_000_000,
-                AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel
-            ]
+                AVVideoAverageBitRateKey: NPAConfig.animate ? 2_000_000 : 400_000,
+                AVVideoProfileLevelKey: AVVideoProfileLevelH264BaselineAutoLevel,
+                AVVideoMaxKeyFrameIntervalKey: 1,
+            ],
         ]
 
-        let writerInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: outputSettings)
+        input.expectsMediaDataInRealTime = false
+
         let adaptor = AVAssetWriterInputPixelBufferAdaptor(
-            assetWriterInput: writerInput,
+            assetWriterInput: input,
             sourcePixelBufferAttributes: [
-                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32ARGB,
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
                 kCVPixelBufferWidthKey as String: Int(size.width),
-                kCVPixelBufferHeightKey as String: Int(size.height)
+                kCVPixelBufferHeightKey as String: Int(size.height),
             ]
         )
 
-        writerInput.expectsMediaDataInRealTime = false
-        writer.add(writerInput)
-        writer.startWriting()
+        guard writer.canAdd(input) else { return false }
+        writer.add(input)
+        guard writer.startWriting() else { return false }
         writer.startSession(atSourceTime: .zero)
 
-        let ciContext = CIContext()
-        let baseCI = CIImage(cgImage: cgImage)
+        let frames = NPAConfig.animate ? max(2, Int(NPAConfig.loopSeconds * Double(NPAConfig.fps))) : 2
+        var failed = false
 
-        DispatchQueue.global(qos: .userInitiated).async {
-            for frame in 0..<totalFrames {
-                while !writerInput.isReadyForMoreMediaData {
-                    Thread.sleep(forTimeInterval: 0.005)
+        for index in 0 ..< frames {
+            var waited = 0
+            while !input.isReadyForMoreMediaData {
+                if writer.status != .writing || waited > 2000 {
+                    failed = true
+                    break
                 }
-
-                let t = Double(frame) / Double(totalFrames)
-                // Cosine ease so velocity is zero at frame 0 and frame N → seamless loop
-                let scale = 1.0 + amplitude * (1.0 - cos(2.0 * .pi * t)) / 2.0
-
-                // Scale and center the image
-                let tx = size.width * (1.0 - scale) / 2.0
-                let ty = size.height * (1.0 - scale) / 2.0
-                let transform = CGAffineTransform(translationX: tx, y: ty)
-                    .scaledBy(x: scale, y: scale)
-
-                let transformed = baseCI
-                    .transformed(by: CGAffineTransform(scaleX: size.width / baseCI.extent.width,
-                                                       y: size.height / baseCI.extent.height))
-                    .transformed(by: transform)
-                    .cropped(to: CGRect(origin: .zero, size: size))
-
-                guard let pool = adaptor.pixelBufferPool else { continue }
-                var pixelBuffer: CVPixelBuffer?
-                CVPixelBufferPoolCreatePixelBuffer(nil, pool, &pixelBuffer)
-                guard let pb = pixelBuffer else { continue }
-
-                ciContext.render(transformed, to: pb)
-
-                let pts = CMTime(value: CMTimeValue(frame), timescale: CMTimeScale(fps))
-                adaptor.append(pb, withPresentationTime: pts)
+                Thread.sleep(forTimeInterval: 0.005)
+                waited += 1
             }
+            if failed { break }
 
-            writerInput.markAsFinished()
-            writer.finishWriting {
-                completion(writer.status == .completed)
+            var buffer: CVPixelBuffer?
+            if let pool = adaptor.pixelBufferPool {
+                CVPixelBufferPoolCreatePixelBuffer(nil, pool, &buffer)
+            }
+            if buffer == nil {
+                CVPixelBufferCreate(nil, Int(size.width), Int(size.height),
+                                    kCVPixelFormatType_32BGRA, nil, &buffer)
+            }
+            guard let pixelBuffer = buffer else { failed = true; break }
+
+            CVPixelBufferLockBaseAddress(pixelBuffer, [])
+            let progress = NPAConfig.animate ? CGFloat(index) / CGFloat(frames) : 0
+            let amplitude = NPAConfig.animate ? NPAConfig.zoomAmplitude : 0
+            let drawn = drawFrame(cgImage, into: pixelBuffer, size: size,
+                                  progress: progress, amplitude: amplitude)
+            CVPixelBufferUnlockBaseAddress(pixelBuffer, [])
+
+            if !drawn || !adaptor.append(pixelBuffer, withPresentationTime: CMTime(value: CMTimeValue(index), timescale: NPAConfig.fps)) {
+                failed = true
+                break
             }
         }
+
+        input.markAsFinished()
+        let semaphore = DispatchSemaphore(value: 0)
+        writer.finishWriting { semaphore.signal() }
+        semaphore.wait()
+
+        if failed || writer.status != .completed {
+            try? FileManager.default.removeItem(at: url)
+            return false
+        }
+        return true
+    }
+
+    private static func drawFrame(
+        _ image: CGImage, into pixelBuffer: CVPixelBuffer,
+        size: CGSize, progress: CGFloat, amplitude: CGFloat
+    ) -> Bool {
+        guard let context = CGContext(
+            data: CVPixelBufferGetBaseAddress(pixelBuffer),
+            width: Int(size.width),
+            height: Int(size.height),
+            bitsPerComponent: 8,
+            bytesPerRow: CVPixelBufferGetBytesPerRow(pixelBuffer),
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+        ) else { return false }
+
+        let zoom = 1.0 + Double(amplitude) * (0.5 - 0.5 * cos(2.0 * .pi * Double(progress)))
+        let width = size.width * CGFloat(zoom)
+        let height = size.height * CGFloat(zoom)
+
+        context.translateBy(x: 0, y: size.height)
+        context.scaleBy(x: 1, y: -1)
+        context.interpolationQuality = .high
+        context.draw(image, in: CGRect(
+            x: (size.width - width) / 2.0,
+            y: (size.height - height) / 2.0,
+            width: width, height: height
+        ))
+        return true
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Patcher (caching + hook logic)
-// ─────────────────────────────────────────────────────────────────────────────
+// MARK: - Patcher
 
-private final class NowPlayingArtworkPatcher {
+typealias NPASetNowPlayingInfoIMP = @convention(c) (AnyObject, Selector, NSDictionary?) -> Void
+
+final class NowPlayingArtworkPatcher {
     static let shared = NowPlayingArtworkPatcher()
 
-    private let queue = DispatchQueue(label: "npa.patcher", qos: .userInitiated)
-    private var previewCache: [String: UIImage] = [:]
-    private var videoCache: [String: URL] = [:]
-    private var pending: Set<String> = []
-    private let cacheDir: URL
+    var original: NPASetNowPlayingInfoIMP?
 
-    private init() {
-        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("NPFArt", isDirectory: true)
-        try? FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
-        cacheDir = tmp
-        pruneOldFiles()
-    }
+    private let lock = NSLock()
+    private var previews: [String: UIImage] = [:]
+    private var rendering: Set<String> = []
 
-    /// Stable artwork ID from now-playing info.
-    func artworkID(from info: [String: Any]) -> String {
-        // Prefer the external content identifier (most reliable)
-        if let extID = info[MPNowPlayingInfoPropertyExternalContentIdentifier] as? String, !extID.isEmpty {
-            return extID
-        }
-        // Fallback to artist + album + title hash
-        let artist = info[MPMediaItemPropertyArtist] as? String ?? ""
-        let album  = info[MPMediaItemPropertyAlbumTitle] as? String ?? ""
-        let title  = info[MPMediaItemPropertyTitle] as? String ?? ""
-        let combined = "\(artist)|\(album)|\(title)"
-        // Simple hash string
-        var hash: UInt64 = 5381
-        for byte in combined.utf8 { hash = hash &* 33 &+ UInt64(byte) }
-        return String(hash, radix: 16)
-    }
+    private lazy var cacheDirectory: URL = {
+        let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        let directory = base.appendingPathComponent("NowPlayingFullArt", isDirectory: true)
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        return directory
+    }()
 
-    /// Patch now-playing info with animated artwork.
-    func patch(info: inout [String: Any]) {
-        // Check system support: the class must have the animated artwork key selector.
-        // We use the string key directly — if the system doesn't recognise it, the
-        // artwork is silently ignored, which is safe.
-        let animatedKey = "MPNowPlayingInfoProperty3x4AnimatedArtwork"
+    // MARK: Entry point
+
+    func patched(_ info: NSDictionary?) -> NSDictionary? {
+        guard #available(iOS 26.0, *) else { return info }
+        guard let info = info as? [String: Any] else { return info }
 
         // Don't replace if already present
-        if info[animatedKey] != nil { return }
+        if info[MPNowPlayingInfoProperty3x4AnimatedArtwork] != nil { return info as NSDictionary }
+
+        // Check system supports animated artwork keys
+        guard MPNowPlayingInfoCenter.supportedAnimatedArtworkKeys
+            .contains(MPNowPlayingInfoProperty3x4AnimatedArtwork) else { return info as NSDictionary }
 
         // Get the static artwork
-        guard let artwork = info[MPMediaItemPropertyArtwork] as? MPMediaItemArtwork else { return }
-        let coverImage = artwork.image(at: CGSize(width: 1024, height: 1024))
-        guard let cover = coverImage else { return }
-
-        let aid = artworkID(from: info)
-
-        // Build 3:4 preview
-        let preview: UIImage
-        if let cached = queue.sync(execute: { previewCache[aid] }) {
-            preview = cached
-        } else if let composed = ArtworkComposer.compose(cover: cover, outputSize: NPAConfig.previewSize) {
-            queue.sync { previewCache[aid] = composed }
-            preview = composed
-        } else {
-            return
+        guard let artwork = info[MPMediaItemPropertyArtwork] as? MPMediaItemArtwork else {
+            return info as NSDictionary
         }
 
-        // Create the animated artwork object
-        let animArtwork = createAnimatedArtwork(id: aid, preview: preview, cover: cover)
-        info[animatedKey] = animArtwork
+        let identifier = artworkIdentifier(for: info)
+
+        guard let preview = previewImage(for: identifier, artwork: artwork) else {
+            return info as NSDictionary
+        }
+
+        // Create the animated artwork using the real Swift API
+        let animated = MPMediaItemAnimatedArtwork(
+            artworkID: identifier,
+            previewImageRequestHandler: { _ in preview },
+            videoAssetFileURLRequestHandler: { [weak self] _ in
+                guard let self = self else { return nil }
+                return await self.videoURL(for: identifier, preview: preview)
+            }
+        )
+
+        var patched = info
+        patched[MPNowPlayingInfoProperty3x4AnimatedArtwork] = animated
+        return patched as NSDictionary
     }
 
-    private func createAnimatedArtwork(id: String, preview: UIImage, cover: UIImage) -> NSObject? {
-        guard let artworkClass = NSClassFromString("MPMediaItemAnimatedArtwork") else { return nil }
+    // MARK: Preview images
 
-        // Swift forbids .alloc() — call it through the ObjC runtime directly
-        let allocSel = NSSelectorFromString("alloc")
-        guard let allocMethod = class_getClassMethod(artworkClass, allocSel) else { return nil }
-        let allocIMP = method_getImplementation(allocMethod)
-        typealias AllocFn = @convention(c) (AnyClass, Selector) -> NSObject
-        let allocFn = unsafeBitCast(allocIMP, to: AllocFn.self)
-        let instance = allocFn(artworkClass, allocSel)
-
-        let initSel = NSSelectorFromString("initWithArtworkID:previewImageRequestHandler:videoAssetFileURLRequestHandler:")
-
-        // Preview handler — stateless, captures cover by value
-        let previewHandler: @convention(block) (CGSize, @escaping (UIImage?) -> Void) -> Void = { size, completion in
-            if let composed = ArtworkComposer.compose(cover: cover, outputSize: size) {
-                completion(composed)
-            } else {
-                completion(preview)
-            }
+    private func previewImage(for identifier: String, artwork: MPMediaItemArtwork) -> UIImage? {
+        lock.lock()
+        if let cached = previews[identifier] {
+            lock.unlock()
+            return cached
         }
+        lock.unlock()
 
-        // Video handler — needs self for caching
-        let videoHandler: @convention(block) (CGSize, @escaping (URL?) -> Void) -> Void = { [weak self] size, completion in
-            guard let self = self else { completion(nil); return }
+        guard let cover = artwork.image(at: CGSize(width: 1200, height: 1200)) else { return nil }
+        guard let composed = ArtworkComposer.compose(cover, size: NPAConfig.previewSize) else { return nil }
 
-            // Check video cache
-            if let cached = self.queue.sync(execute: { self.videoCache[id] }),
-               FileManager.default.fileExists(atPath: cached.path) {
-                completion(cached)
-                return
-            }
+        lock.lock()
+        if previews.count >= NPAConfig.maxCachedPreviews { previews.removeAll() }
+        previews[identifier] = composed
+        lock.unlock()
 
-            // Check if already rendering
-            let alreadyPending = self.queue.sync { () -> Bool in
-                if self.pending.contains(id) { return true }
-                self.pending.insert(id)
-                return false
-            }
-            if alreadyPending { completion(nil); return }
-
-            // Build the 3:4 portrait for video
-            guard let portrait = ArtworkComposer.compose(cover: cover, outputSize: NPAConfig.videoSize) else {
-                _ = self.queue.sync { self.pending.remove(id) }
-                completion(nil)
-                return
-            }
-
-            let outputURL = self.cacheDir.appendingPathComponent("\(id).mp4")
-
-            if NPAConfig.animate {
-                VideoMaker.render(
-                    image: portrait,
-                    to: outputURL,
-                    size: NPAConfig.videoSize,
-                    duration: NPAConfig.loopSeconds,
-                    fps: NPAConfig.fps,
-                    amplitude: NPAConfig.zoomAmplitude
-                ) { success in
-                    self.queue.sync {
-                        self.pending.remove(id)
-                        if success { self.videoCache[id] = outputURL }
-                    }
-                    completion(success ? outputURL : nil)
-                    self.pruneOldFiles()
-                }
-            } else {
-                VideoMaker.render(
-                    image: portrait,
-                    to: outputURL,
-                    size: NPAConfig.videoSize,
-                    duration: 0.1,
-                    fps: 2,
-                    amplitude: 0.0
-                ) { success in
-                    self.queue.sync {
-                        self.pending.remove(id)
-                        if success { self.videoCache[id] = outputURL }
-                    }
-                    completion(success ? outputURL : nil)
-                }
-            }
-        }
-
-        // Invoke init through ObjC runtime
-        typealias InitMethod = @convention(c) (NSObject, Selector, NSString, Any, Any) -> NSObject?
-        guard let initMethod = class_getInstanceMethod(artworkClass, initSel) else { return nil }
-        let initIMP = method_getImplementation(initMethod)
-        let initFn = unsafeBitCast(initIMP, to: InitMethod.self)
-        return initFn(instance, initSel, id as NSString, previewHandler, videoHandler)
+        return composed
     }
 
-    private func pruneOldFiles() {
-        DispatchQueue.global(qos: .utility).async { [cacheDir] in
-            let fm = FileManager.default
-            guard let files = try? fm.contentsOfDirectory(at: cacheDir,
-                                                          includingPropertiesForKeys: [.contentModificationDateKey],
-                                                          options: .skipsHiddenFiles) else { return }
-            let mp4s = files.filter { $0.pathExtension == "mp4" }
-            guard mp4s.count > NPAConfig.maxCachedFiles else { return }
+    // MARK: Video files
 
-            let sorted = mp4s.sorted {
-                let d0 = (try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-                let d1 = (try? $1.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-                return d0 < d1
+    private func videoURL(for identifier: String, preview: UIImage) async -> URL? {
+        let url = videoFileURL(for: identifier)
+        if FileManager.default.fileExists(atPath: url.path) { return url }
+
+        let isOwner = beginRendering(identifier)
+
+        if !isOwner {
+            for _ in 0 ..< 300 {
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                if FileManager.default.fileExists(atPath: url.path) { return url }
             }
-            for file in sorted.prefix(mp4s.count - NPAConfig.maxCachedFiles) {
-                try? fm.removeItem(at: file)
-            }
+            return nil
         }
+
+        defer { endRendering(identifier) }
+
+        let ok = await VideoMaker.make(image: preview, size: NPAConfig.videoSize, url: url)
+
+        if ok {
+            pruneCache()
+            return url
+        }
+        return nil
+    }
+
+    private func videoFileURL(for identifier: String) -> URL {
+        cacheDirectory.appendingPathComponent(identifier + ".mp4")
+    }
+
+    private func beginRendering(_ identifier: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if rendering.contains(identifier) { return false }
+        rendering.insert(identifier)
+        return true
+    }
+
+    private func endRendering(_ identifier: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        rendering.remove(identifier)
+    }
+
+    private func pruneCache() {
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: cacheDirectory,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else { return }
+
+        guard files.count > NPAConfig.maxCachedVideos else { return }
+
+        let sorted = files.sorted { lhs, rhs in
+            let left = (try? lhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            let right = (try? rhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            return left > right
+        }
+
+        for stale in sorted.dropFirst(NPAConfig.maxCachedVideos) {
+            try? FileManager.default.removeItem(at: stale)
+        }
+    }
+
+    // MARK: Identity
+
+    private func artworkIdentifier(for info: [String: Any]) -> String {
+        if let external = info[MPNowPlayingInfoPropertyExternalContentIdentifier] as? String,
+           !external.isEmpty {
+            return safeName(external)
+        }
+
+        let artist = info[MPMediaItemPropertyArtist] as? String ?? ""
+        let album = info[MPMediaItemPropertyAlbumTitle] as? String ?? ""
+        let title = info[MPMediaItemPropertyTitle] as? String ?? ""
+        let combined = "\(artist)|\(album)|\(title)"
+        if !combined.replacingOccurrences(of: "|", with: "").isEmpty {
+            return safeName(combined)
+        }
+
+        return "npa-unknown-\(Int(Date().timeIntervalSince1970))"
+    }
+
+    private func safeName(_ raw: String) -> String {
+        var out = ""
+        for scalar in raw.unicodeScalars {
+            if CharacterSet.alphanumerics.contains(scalar) {
+                out.unicodeScalars.append(scalar)
+            } else {
+                out.append("_")
+            }
+            if out.count >= 96 { break }
+        }
+        return out.isEmpty ? "npa-unknown" : out
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Hook installation
-// ─────────────────────────────────────────────────────────────────────────────
 
-/// Original IMP, kept so we can call through.
-private var originalSetNowPlayingInfo: IMP?
-
-/// The replacement block for setNowPlayingInfo:.
-/// imp_implementationWithBlock expects (id self, ...) — the selector is implicit.
-private let hookBlock: @convention(block) (AnyObject, NSDictionary?) -> Void = { self_, info in
-    let sel = NSSelectorFromString("setNowPlayingInfo:")
-
-    guard var dict = info as? [String: Any] else {
-        // Call original with nil
-        typealias Fn = @convention(c) (AnyObject, Selector, NSDictionary?) -> Void
-        let orig = unsafeBitCast(originalSetNowPlayingInfo!, to: Fn.self)
-        orig(self_, sel, info)
-        return
-    }
-
-    NowPlayingArtworkPatcher.shared.patch(info: &dict)
-
-    typealias Fn = @convention(c) (AnyObject, Selector, NSDictionary?) -> Void
-    let orig = unsafeBitCast(originalSetNowPlayingInfo!, to: Fn.self)
-    orig(self_, sel, dict as NSDictionary)
+private let npaHook: NPASetNowPlayingInfoIMP = { object, selector, info in
+    let patcher = NowPlayingArtworkPatcher.shared
+    let patched = patcher.patched(info)
+    patcher.original?(object, selector, patched)
 }
 
 @_cdecl("npa_bootstrap")
-public func npa_bootstrap() {
-    guard let cls = NSClassFromString("MPNowPlayingInfoCenter") else {
-        NSLog("[NPFArt] MPNowPlayingInfoCenter not found")
+public func npaBootstrap() {
+    guard #available(iOS 26.0, *) else {
+        NSLog("[NPFArt] iOS 26+ required")
         return
     }
 
-    let sel = NSSelectorFromString("setNowPlayingInfo:")
-    guard let method = class_getInstanceMethod(cls, sel) else {
+    if NowPlayingArtworkPatcher.shared.original != nil { return }
+
+    let target: AnyClass = MPNowPlayingInfoCenter.self
+    let selector = NSSelectorFromString("setNowPlayingInfo:")
+
+    guard let method = class_getInstanceMethod(target, selector) else {
         NSLog("[NPFArt] setNowPlayingInfo: method not found")
         return
     }
 
-    let newIMP = imp_implementationWithBlock(hookBlock)
-    originalSetNowPlayingInfo = method_setImplementation(method, newIMP)
+    let originalIMP = method_getImplementation(method)
+    NowPlayingArtworkPatcher.shared.original = unsafeBitCast(originalIMP, to: NPASetNowPlayingInfoIMP.self)
+
+    method_setImplementation(method, unsafeBitCast(npaHook, to: IMP.self))
     NSLog("[NPFArt] Hook installed — Plexamp full-screen artwork active")
 }
