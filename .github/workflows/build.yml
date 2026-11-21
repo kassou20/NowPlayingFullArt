@@ -26,11 +26,32 @@ jobs:
       - name: Compile dylib
         run: |
           chmod +x build.sh
-          ./build.sh
+          ./build.sh 2>&1 | tee build_output.txt || true
+          # Check if dylib was produced
+          if [ -f out/NowPlayingFullArt.dylib ]; then
+            echo "BUILD_OK=true" >> $GITHUB_ENV
+          else
+            echo "BUILD_OK=false" >> $GITHUB_ENV
+          fi
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build_output.txt
+          if-no-files-found: warn
 
       - name: Publish artifact
+        if: env.BUILD_OK == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: NowPlayingFullArt
           path: out/*.dylib
           if-no-files-found: error
+
+      - name: Fail if build failed
+        if: env.BUILD_OK != 'true'
+        run: |
+          echo "Build failed — check build-log artifact for errors"
+          exit 1
