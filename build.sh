@@ -1,10 +1,10 @@
 #!/bin/bash
 set -euo pipefail
 
-# ─────────────────────────────────────────────────────────────────────────────
-# build.sh — Compile NowPlayingFullArt dylib for iOS (arm64)
-# Requires: macOS with Xcode 26+ (iOS 26 SDK)
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# build.sh — Compile NowPlayingFullArt.dylib (pure Objective-C) for iOS arm64
+# Requires: macOS with Xcode (iOS SDK)
+# ---------------------------------------------------------------------------
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SRC="$SCRIPT_DIR/Sources"
@@ -13,62 +13,33 @@ PRODUCT="NowPlayingFullArt"
 
 mkdir -p "$OUT"
 
-# Find the iOS SDK
 SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
 TARGET="arm64-apple-ios17.0"
 echo "SDK: $SDK"
 echo "Target: $TARGET"
 
-# ── Probe: does this SDK have MPMediaItemAnimatedArtwork? ──
-echo "Checking for MPMediaItemAnimatedArtwork..."
-PROBE=$(mktemp /tmp/npa_probe.XXXXXX.swift)
-cat > "$PROBE" <<'EOF'
-import MediaPlayer
-// Class is @available(iOS 19.0, *) — wrap in availability check for the probe
-if #available(iOS 19.0, *) {
-    let _ = MPMediaItemAnimatedArtwork.self
-}
-EOF
-if ! swiftc -typecheck -sdk "$SDK" -target "$TARGET" "$PROBE" 2>/dev/null; then
-    echo "ERROR: This SDK does not have MPMediaItemAnimatedArtwork."
-    echo "       You need Xcode 26 (iOS 26 SDK) or newer."
-    rm -f "$PROBE"
-    exit 1
-fi
-rm -f "$PROBE"
-echo "API found ✓"
-
-# ── Compile bootstrap.c ──
-echo "Compiling bootstrap.c..."
+echo "Compiling $PRODUCT.dylib (Objective-C)..."
 xcrun clang -arch arm64 -isysroot "$SDK" \
     -miphoneos-version-min=17.0 \
-    -c "$SRC/bootstrap.c" \
-    -o "$OUT/bootstrap.o"
-
-# ── Compile Swift source → dylib (fallback mode) ──
-echo "Compiling $PRODUCT.dylib (fallback)..."
-swiftc \
-    -sdk "$SDK" \
-    -target "$TARGET" \
-    -emit-library \
+    -dynamiclib \
     -o "$OUT/$PRODUCT.dylib" \
-    -module-name "$PRODUCT" \
-    -Xlinker -install_name -Xlinker "@rpath/$PRODUCT.dylib" \
-    -Xlinker "$OUT/bootstrap.o" \
+    -install_name "@rpath/$PRODUCT.dylib" \
+    -framework Foundation \
     -framework UIKit \
     -framework MediaPlayer \
     -framework AVFoundation \
     -framework CoreImage \
-    "$SRC/NowPlayingFullArt.swift"
+    -lobjc \
+    -fobjc-arc \
+    "$SRC/NowPlayingFullArt.m"
 
-# ── Verify the binary references the right symbol ──
-if nm "$OUT/$PRODUCT.dylib" | grep -q "MPMediaItemAnimatedArtwork"; then
-    echo "Symbol check: MPMediaItemAnimatedArtwork found ✓"
+# Verify the binary has the constructor
+if nm "$OUT/$PRODUCT.dylib" | grep -q "npa_constructor"; then
+    echo "Symbol check: npa_constructor found ✓"
 else
-    echo "WARNING: MPMediaItemAnimatedArtwork not found in binary"
+    echo "WARNING: npa_constructor not found in binary"
 fi
 
-# ── Summary ──
 echo ""
 echo "Build complete!"
 ls -lh "$OUT/$PRODUCT.dylib"
