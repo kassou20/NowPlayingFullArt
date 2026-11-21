@@ -614,10 +614,10 @@ static NSDictionary *patchedInfo(NSDictionary *info) {
         [inv setArgument:&previewHandler atIndex:3];
         [inv setArgument:&videoHandler atIndex:4];
         [inv invoke];
-        [inv getReturnValue:&artwork3x4];
-        // Ensure ARC retains the returned object
-        CFBridgingRetain(artwork3x4);
-        artwork3x4 = (__bridge_transfer id)((__bridge CFTypeRef)artwork3x4);
+
+        void *returnVal3x4 = NULL;
+        [inv getReturnValue:&returnVal3x4];
+        artwork3x4 = (__bridge_transfer id)returnVal3x4;
     }
 
     if (!artwork3x4) {
@@ -642,9 +642,10 @@ static NSDictionary *patchedInfo(NSDictionary *info) {
                 [inv setArgument:&previewHandler atIndex:3];
                 [inv setArgument:&videoHandler atIndex:4];
                 [inv invoke];
-                [inv getReturnValue:&artwork1x1];
-                CFBridgingRetain(artwork1x1);
-                artwork1x1 = (__bridge_transfer id)((__bridge CFTypeRef)artwork1x1);
+
+                void *returnVal1x1 = NULL;
+                [inv getReturnValue:&returnVal1x1];
+                artwork1x1 = (__bridge_transfer id)returnVal1x1;
             }
         }
     }

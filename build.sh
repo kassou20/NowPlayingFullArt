@@ -28,6 +28,7 @@ xcrun clang -arch arm64 -isysroot "$SDK" \
     -framework UIKit \
     -framework MediaPlayer \
     -framework AVFoundation \
+    -framework CoreMedia \
     -framework CoreImage \
     -lobjc \
     -fobjc-arc \
