@@ -246,8 +246,10 @@ final class NowPlayingArtworkPatcher {
         if info[MPNowPlayingInfoProperty3x4AnimatedArtwork] != nil { return info as NSDictionary }
 
         // Check system supports animated artwork keys
-        guard MPNowPlayingInfoCenter.supportedAnimatedArtworkKeys
-            .contains(MPNowPlayingInfoProperty3x4AnimatedArtwork) else { return info as NSDictionary }
+        let supportedKeys = MPNowPlayingInfoCenter.supportedAnimatedArtworkKeys
+        let has3x4 = supportedKeys.contains(MPNowPlayingInfoProperty3x4AnimatedArtwork)
+        let has1x1 = supportedKeys.contains(MPNowPlayingInfoProperty1x1AnimatedArtwork)
+        guard has3x4 || has1x1 else { return info as NSDictionary }
 
         // Get the static artwork
         guard let artwork = info[MPMediaItemPropertyArtwork] as? MPMediaItemArtwork else {
@@ -261,7 +263,7 @@ final class NowPlayingArtworkPatcher {
         }
 
         // Create the animated artwork using the real Swift API
-        let animated = MPMediaItemAnimatedArtwork(
+        let animated3x4 = MPMediaItemAnimatedArtwork(
             artworkID: identifier,
             previewImageRequestHandler: { _ in preview },
             videoAssetFileURLRequestHandler: { [weak self] _ in
@@ -270,8 +272,20 @@ final class NowPlayingArtworkPatcher {
             }
         )
 
+        // Square 1:1 variant (same video, iOS crops to fit)
+        let animated1x1 = MPMediaItemAnimatedArtwork(
+            artworkID: identifier + "_1x1",
+            previewImageRequestHandler: { _ in preview },
+            videoAssetFileURLRequestHandler: { [weak self] _ in
+                guard let self = self else { return nil }
+                return await self.videoURL(for: identifier, preview: preview)
+            }
+        )
+
         var patched = info
-        patched[MPNowPlayingInfoProperty3x4AnimatedArtwork] = animated
+        if has3x4 { patched[MPNowPlayingInfoProperty3x4AnimatedArtwork] = animated3x4 }
+        if has1x1 { patched[MPNowPlayingInfoProperty1x1AnimatedArtwork] = animated1x1 }
+        NSLog("[NPFArt] Patched nowPlayingInfo with animated artwork (3x4:%d 1x1:%d)", has3x4 ? 1 : 0, has1x1 ? 1 : 0)
         return patched as NSDictionary
     }
 
