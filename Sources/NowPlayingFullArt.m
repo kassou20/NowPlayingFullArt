@@ -258,18 +258,19 @@ static BOOL drawFrame(CGImageRef image, CVPixelBufferRef pixelBuffer,
 }
 
 // ---------------------------------------------------------------------------
-#pragma mark - Video Rendering (H.264 zoom-loop)
+#pragma mark - Video Rendering (HEVC zoom-loop + AVAssetExportSession re-export)
 // ---------------------------------------------------------------------------
 
-static BOOL renderVideo(UIImage *image, CGSize size, NSURL *url) {
+/// Phase 1: Generate raw HEVC frames with AVAssetWriter
+static BOOL renderRawVideo(UIImage *image, CGSize size, NSURL *rawURL) {
     CGImageRef cgImage = image.CGImage;
     if (!cgImage) return NO;
 
     NSFileManager *fm = [NSFileManager defaultManager];
-    [fm removeItemAtURL:url error:nil];
+    [fm removeItemAtURL:rawURL error:nil];
 
     NSError *error = nil;
-    AVAssetWriter *writer = [[AVAssetWriter alloc] initWithURL:url
+    AVAssetWriter *writer = [[AVAssetWriter alloc] initWithURL:rawURL
                                                       fileType:AVFileTypeMPEG4
                                                          error:&error];
     if (!writer) {
@@ -277,14 +278,14 @@ static BOOL renderVideo(UIImage *image, CGSize size, NSURL *url) {
         return NO;
     }
 
+    // HEVC codec — matches spotifyglass/spoti.pw pattern
     NSDictionary *compressionProps = @{
-        AVVideoAverageBitRateKey: @(2000000),
-        AVVideoProfileLevelKey: AVVideoProfileLevelH264BaselineAutoLevel,
+        AVVideoAverageBitRateKey: @(3000000),
         AVVideoMaxKeyFrameIntervalKey: @(1),
     };
 
     NSDictionary *outputSettings = @{
-        AVVideoCodecKey: AVVideoCodecTypeH264,
+        AVVideoCodecKey: AVVideoCodecTypeHEVC,
         AVVideoWidthKey: @((int)size.width),
         AVVideoHeightKey: @((int)size.height),
         AVVideoCompressionPropertiesKey: compressionProps,
@@ -375,13 +376,124 @@ static BOOL renderVideo(UIImage *image, CGSize size, NSURL *url) {
     dispatch_semaphore_wait(sema, DISPATCH_TIME_FOREVER);
 
     if (failed || writer.status != AVAssetWriterStatusCompleted) {
-        NPFLog(@"Video render failed, status=%ld error=%@",
+        NPFLog(@"Raw video render failed, status=%ld error=%@",
                (long)writer.status, writer.error);
-        [fm removeItemAtURL:url error:nil];
+        [fm removeItemAtURL:rawURL error:nil];
+        return NO;
+    }
+
+    NPFLog(@"Raw HEVC video generated: %@", rawURL.lastPathComponent);
+    return YES;
+}
+
+/// Phase 2: Re-export through AVAssetExportSession for proper MP4 metadata
+/// (moov atom placement, timing, compatibility — matches spotifyglass pattern
+///  which uses AVAssetExportSession + AVAssetExportPresetHighestQuality)
+static BOOL reexportVideo(NSURL *rawURL, NSURL *finalURL) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    [fm removeItemAtURL:finalURL error:nil];
+
+    AVAsset *asset = [AVAsset assetWithURL:rawURL];
+
+    // Check the asset loaded properly
+    NSArray *tracks = [asset tracksWithMediaType:AVMediaTypeVideo];
+    if (tracks.count == 0) {
+        NPFLog(@"Re-export: no video tracks in raw file");
+        return NO;
+    }
+
+    // Use HEVCHighestQuality to guarantee HEVC output
+    AVAssetExportSession *exporter = [AVAssetExportSession
+        exportSessionWithAsset:asset
+                    presetName:AVAssetExportPresetHEVCHighestQuality];
+    if (!exporter) {
+        NPFLog(@"Re-export: could not create AVAssetExportSession, trying HighestQuality");
+        exporter = [AVAssetExportSession
+            exportSessionWithAsset:asset
+                        presetName:AVAssetExportPresetHighestQuality];
+    }
+    if (!exporter) {
+        NPFLog(@"Re-export: no export session available");
+        return NO;
+    }
+
+    exporter.outputURL = finalURL;
+    exporter.outputFileType = AVFileTypeMPEG4;
+    exporter.shouldOptimizeForNetworkUse = YES;  // moov atom at front
+
+    dispatch_semaphore_t sema = dispatch_semaphore_create(0);
+    [exporter exportAsynchronouslyWithCompletionHandler:^{
+        dispatch_semaphore_signal(sema);
+    }];
+    dispatch_semaphore_wait(sema, DISPATCH_TIME_FOREVER);
+
+    if (exporter.status != AVAssetExportSessionStatusCompleted) {
+        NPFLog(@"Re-export failed: status=%ld error=%@",
+               (long)exporter.status, exporter.error);
+        [fm removeItemAtURL:finalURL error:nil];
+        return NO;
+    }
+
+    NPFLog(@"Re-exported HEVC video: %@ (%.0f KB)",
+           finalURL.lastPathComponent,
+           (double)[fm attributesOfItemAtPath:finalURL.path error:nil].fileSize / 1024.0);
+    return YES;
+}
+
+/// Full pipeline: generate HEVC → re-export for proper metadata
+static BOOL renderVideo(UIImage *image, CGSize size, NSURL *finalURL) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSURL *rawURL = [NSURL fileURLWithPath:
+        [finalURL.path stringByAppendingString:@".raw.mp4"]];
+
+    // Phase 1: generate raw HEVC
+    if (!renderRawVideo(image, size, rawURL)) {
+        return NO;
+    }
+
+    // Phase 2: re-export for proper metadata
+    BOOL ok = reexportVideo(rawURL, finalURL);
+
+    // Clean up raw file
+    [fm removeItemAtURL:rawURL error:nil];
+
+    if (!ok) {
+        NPFLog(@"Re-export failed, using raw video as fallback");
+        // Fallback: just rename the raw file (re-generate it)
+        if (renderRawVideo(image, size, finalURL)) {
+            return YES;
+        }
         return NO;
     }
 
     return YES;
+}
+
+// ---------------------------------------------------------------------------
+#pragma mark - Extract First Frame (preview = video first frame, like spoti.pw)
+// ---------------------------------------------------------------------------
+
+static UIImage *extractFirstFrame(NSURL *videoURL) {
+    AVAsset *asset = [AVAsset assetWithURL:videoURL];
+    AVAssetImageGenerator *gen = [[AVAssetImageGenerator alloc] initWithAsset:asset];
+    gen.appliesPreferredTrackTransform = YES;
+    gen.requestedTimeToleranceBefore = kCMTimeZero;
+    gen.requestedTimeToleranceAfter = kCMTimeZero;
+
+    NSError *error = nil;
+    CGImageRef cgImage = [gen copyCGImageAtTime:kCMTimeZero
+                                     actualTime:NULL
+                                          error:&error];
+    if (!cgImage) {
+        NPFLog(@"Failed to extract first frame: %@", error);
+        return nil;
+    }
+
+    UIImage *image = [UIImage imageWithCGImage:cgImage];
+    CGImageRelease(cgImage);
+    NPFLog(@"Extracted first frame: %.0fx%.0f",
+           image.size.width, image.size.height);
+    return image;
 }
 
 // ---------------------------------------------------------------------------
@@ -683,9 +795,12 @@ static void hooked_setNowPlayingInfo(id self, SEL _cmd, NSDictionary *info) {
 
         if (videoReady) {
             // === FAST PATH: video exists, patch immediately ===
+            // Use video first frame as preview (matches spoti.pw pattern)
+            UIImage *videoPreview = extractFirstFrame(videoURL);
+            if (!videoPreview) videoPreview = preview;
             NPFLog(@"Video ready for %@ - %@, patching NOW", artist, title);
             NSDictionary *patched = patchInfoWithAnimatedArtwork(
-                info, identifier, preview, videoURL);
+                info, identifier, videoPreview, videoURL);
             if (sOriginalIMP) sOriginalIMP(self, _cmd, patched);
         } else {
             // === SLOW PATH: pass original through, render in background,
@@ -746,11 +861,19 @@ static void hooked_setNowPlayingInfo(id self, SEL _cmd, NSDictionary *info) {
                                 return;
                             }
 
-                            UIImage *currentPreview = cachedPreview(capturedId, nil);
-                            if (!currentPreview) currentPreview = capturedPreview;
+                            // Extract video first frame as preview
+                            // (spoti.pw pattern: preview = video's first frame)
+                            UIImage *videoPreview = extractFirstFrame(renderedURL);
+                            if (!videoPreview) videoPreview = capturedPreview;
+
+                            // Clear cached animated artwork so new ones are created
+                            // with the video-derived preview
+                            [sAnimatedArtworkCache removeObjectForKey:capturedId];
+                            [sAnimatedArtworkCache removeObjectForKey:
+                                [capturedId stringByAppendingString:@"_1x1"]];
 
                             NSDictionary *patched = patchInfoWithAnimatedArtwork(
-                                current, capturedId, currentPreview, renderedURL);
+                                current, capturedId, videoPreview, renderedURL);
 
                             NPFLog(@"Re-triggering setNowPlayingInfo via original IMP");
                             SEL sel = NSSelectorFromString(@"setNowPlayingInfo:");
