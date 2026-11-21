@@ -260,13 +260,20 @@ private final class NowPlayingArtworkPatcher {
     }
 
     private func createAnimatedArtwork(id: String, preview: UIImage, cover: UIImage) -> NSObject? {
-        let cls: AnyClass? = NSClassFromString("MPMediaItemAnimatedArtwork")
-        guard let artworkClass = cls else { return nil }
+        guard let artworkClass = NSClassFromString("MPMediaItemAnimatedArtwork") else { return nil }
 
-        let sel = NSSelectorFromString("initWithArtworkID:previewImageRequestHandler:videoAssetFileURLRequestHandler:")
-        guard let instance = (artworkClass as? NSObject.Type)?.alloc() else { return nil }
+        // Swift forbids .alloc() — call it through the ObjC runtime directly
+        let allocSel = NSSelectorFromString("alloc")
+        guard let allocMethod = class_getClassMethod(artworkClass, allocSel) else { return nil }
+        let allocIMP = method_getImplementation(allocMethod)
+        typealias AllocFn = @convention(c) (AnyClass, Selector) -> NSObject
+        let allocFn = unsafeBitCast(allocIMP, to: AllocFn.self)
+        let instance = allocFn(artworkClass, allocSel)
 
-        let previewHandler: @convention(block) (CGSize, @escaping (UIImage?) -> Void) -> Void = { [weak self] size, completion in
+        let initSel = NSSelectorFromString("initWithArtworkID:previewImageRequestHandler:videoAssetFileURLRequestHandler:")
+
+        // Preview handler — stateless, captures cover by value
+        let previewHandler: @convention(block) (CGSize, @escaping (UIImage?) -> Void) -> Void = { size, completion in
             if let composed = ArtworkComposer.compose(cover: cover, outputSize: size) {
                 completion(composed)
             } else {
@@ -274,6 +281,7 @@ private final class NowPlayingArtworkPatcher {
             }
         }
 
+        // Video handler — needs self for caching
         let videoHandler: @convention(block) (CGSize, @escaping (URL?) -> Void) -> Void = { [weak self] size, completion in
             guard let self = self else { completion(nil); return }
 
@@ -294,7 +302,7 @@ private final class NowPlayingArtworkPatcher {
 
             // Build the 3:4 portrait for video
             guard let portrait = ArtworkComposer.compose(cover: cover, outputSize: NPAConfig.videoSize) else {
-                self.queue.sync { self.pending.remove(id) }
+                _ = self.queue.sync { self.pending.remove(id) }
                 completion(nil)
                 return
             }
@@ -318,7 +326,6 @@ private final class NowPlayingArtworkPatcher {
                     self.pruneOldFiles()
                 }
             } else {
-                // Static: render just 2 identical frames (cheapest valid video)
                 VideoMaker.render(
                     image: portrait,
                     to: outputURL,
@@ -336,14 +343,12 @@ private final class NowPlayingArtworkPatcher {
             }
         }
 
-        // Invoke the init via NSInvocation-style
-        // Since the method takes blocks, use perform selector
+        // Invoke init through ObjC runtime
         typealias InitMethod = @convention(c) (NSObject, Selector, NSString, Any, Any) -> NSObject?
-        let method = class_getInstanceMethod(artworkClass, sel)
-        guard let m = method else { return nil }
-        let imp = method_getImplementation(m)
-        let fn = unsafeBitCast(imp, to: InitMethod.self)
-        return fn(instance, sel, id as NSString, previewHandler, videoHandler)
+        guard let initMethod = class_getInstanceMethod(artworkClass, initSel) else { return nil }
+        let initIMP = method_getImplementation(initMethod)
+        let initFn = unsafeBitCast(initIMP, to: InitMethod.self)
+        return initFn(instance, initSel, id as NSString, previewHandler, videoHandler)
     }
 
     private func pruneOldFiles() {
