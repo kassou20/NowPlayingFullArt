@@ -171,9 +171,12 @@ static UIImage *createPreviewImage(UIImage *cover, CGSize size) {
         kCIInputSaturationKey: @(1.10)
     }];
 
-    if (!sCIContext) {
+    // Thread-safe singleton — CIContext is thread-safe once created,
+    // but creation itself must happen only once.
+    static dispatch_once_t sCIContextOnce;
+    dispatch_once(&sCIContextOnce, ^{
         sCIContext = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @NO}];
-    }
+    });
 
     CGImageRef backgroundCG = [sCIContext createCGImage:treated fromRect:rect];
     if (!backgroundCG) return nil;
@@ -550,6 +553,10 @@ static NSDictionary *patchedInfo(NSDictionary *info) {
         return info;
     }
 
+    // === Everything below touches runtime-resolved classes/selectors.
+    //     Wrap in @try/@catch so a framework change never crashes the app.
+    @try {
+
     // Create MPMediaItemAnimatedArtwork using runtime
     Class artworkClass = NSClassFromString(@"MPMediaItemAnimatedArtwork");
     if (!artworkClass) {
@@ -574,18 +581,41 @@ static NSDictionary *patchedInfo(NSDictionary *info) {
 
     PreviewHandler previewHandler = ^(CGSize requestedSize __unused,
                                       PreviewCompletion completion) {
-        NPFLog(@"Preview requested for %@", capturedId);
-        completion(capturedPreview);
+        @try {
+            NPFLog(@"Preview requested for %@", capturedId);
+            if (completion) {
+                completion(capturedPreview);
+            }
+        } @catch (NSException *e) {
+            NPFLog(@"CRASH in previewHandler: %@ — %@", e.name, e.reason);
+            if (completion) completion(nil);
+        }
     };
 
     VideoHandler videoHandler = ^(CGSize requestedSize __unused,
                                   VideoCompletion completion) {
-        NPFLog(@"Video requested for %@", capturedId);
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-            NSURL *videoURL = ensureVideo(capturedId, capturedPreview);
-            NPFLog(@"Video completion callback, url=%@", videoURL);
-            completion(videoURL);
-        });
+        @try {
+            NPFLog(@"Video requested for %@", capturedId);
+            if (!completion) return;
+            if (!capturedPreview) {
+                NPFLog(@"capturedPreview is nil, cannot render video");
+                completion(nil);
+                return;
+            }
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                @try {
+                    NSURL *videoURL = ensureVideo(capturedId, capturedPreview);
+                    NPFLog(@"Video completion callback, url=%@", videoURL);
+                    completion(videoURL);
+                } @catch (NSException *e) {
+                    NPFLog(@"CRASH in videoHandler background: %@ — %@", e.name, e.reason);
+                    completion(nil);
+                }
+            });
+        } @catch (NSException *e) {
+            NPFLog(@"CRASH in videoHandler: %@ — %@", e.name, e.reason);
+            if (completion) completion(nil);
+        }
     };
 
     // Use objc_msgSend to call the init method with the blocks
@@ -606,6 +636,7 @@ static NSDictionary *patchedInfo(NSDictionary *info) {
         }
 
         NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+        [inv retainArguments]; // Retain/copy blocks and object args
         [inv setTarget:allocated];
         [inv setSelector:initSel];
 
@@ -615,9 +646,13 @@ static NSDictionary *patchedInfo(NSDictionary *info) {
         [inv setArgument:&videoHandler atIndex:4];
         [inv invoke];
 
-        void *returnVal3x4 = NULL;
-        [inv getReturnValue:&returnVal3x4];
-        artwork3x4 = (__bridge_transfer id)returnVal3x4;
+        // SAFE pattern: getReturnValue: writes an unretained pointer.
+        // Using __bridge_transfer on it risks a double-free when
+        // NSInvocation also releases internally.  Read into an
+        // __unsafe_unretained temp and let ARC retain via strong assign.
+        __unsafe_unretained id tempResult3x4 = nil;
+        [inv getReturnValue:&tempResult3x4];
+        artwork3x4 = tempResult3x4;
     }
 
     if (!artwork3x4) {
@@ -634,6 +669,7 @@ static NSDictionary *patchedInfo(NSDictionary *info) {
             NSMethodSignature *sig = [allocated methodSignatureForSelector:initSel];
             if (sig) {
                 NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+                [inv retainArguments]; // Retain/copy blocks and object args
                 [inv setTarget:allocated];
                 [inv setSelector:initSel];
 
@@ -643,9 +679,10 @@ static NSDictionary *patchedInfo(NSDictionary *info) {
                 [inv setArgument:&videoHandler atIndex:4];
                 [inv invoke];
 
-                void *returnVal1x1 = NULL;
-                [inv getReturnValue:&returnVal1x1];
-                artwork1x1 = (__bridge_transfer id)returnVal1x1;
+                // SAFE pattern — same as 3x4 above
+                __unsafe_unretained id tempResult1x1 = nil;
+                [inv getReturnValue:&tempResult1x1];
+                artwork1x1 = tempResult1x1;
             }
         }
     }
@@ -661,6 +698,11 @@ static NSDictionary *patchedInfo(NSDictionary *info) {
 
     NPFLog(@"Set 3x4: %d, 1x1: %d", has3x4 && artwork3x4 != nil, has1x1 && artwork1x1 != nil);
     return [patched copy];
+
+    } @catch (NSException *e) {
+        NPFLog(@"CRASH in patchedInfo runtime section: %@ — %@", e.name, e.reason);
+        return info;  // fall back to unpatched
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -668,9 +710,16 @@ static NSDictionary *patchedInfo(NSDictionary *info) {
 // ---------------------------------------------------------------------------
 
 static void hooked_setNowPlayingInfo(id self, SEL _cmd, NSDictionary *info) {
-    NSDictionary *patched = patchedInfo(info);
-    if (sOriginalIMP) {
-        sOriginalIMP(self, _cmd, patched);
+    @try {
+        NSDictionary *patched = patchedInfo(info);
+        if (sOriginalIMP) {
+            sOriginalIMP(self, _cmd, patched ?: info);
+        }
+    } @catch (NSException *e) {
+        NPFLog(@"CRASH CAUGHT in hooked_setNowPlayingInfo: %@ — %@", e.name, e.reason);
+        if (sOriginalIMP) {
+            sOriginalIMP(self, _cmd, info);  // fall back to unpatched original
+        }
     }
 }
 
@@ -720,6 +769,7 @@ static BOOL resolvePropertyKeys(void) {
 // ---------------------------------------------------------------------------
 
 static void installHook(void) {
+    @try {
     NPFLog(@"Installing hook...");
 
     // Check iOS version: we need iOS 26+ (which reports as 19.0 internally)
@@ -771,6 +821,10 @@ static void installHook(void) {
     method_setImplementation(method, (IMP)hooked_setNowPlayingInfo);
     NPFLog(@"Hook installed on setNowPlayingInfo:");
     NPFLog(@"Full-screen animated artwork active");
+
+    } @catch (NSException *e) {
+        NPFLog(@"CRASH during hook installation: %@ — %@", e.name, e.reason);
+    }
 }
 
 // ---------------------------------------------------------------------------
