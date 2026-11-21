@@ -14,6 +14,7 @@
 #import <AVFoundation/AVFoundation.h>
 #import <CoreImage/CoreImage.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #import <dlfcn.h>
 
 // ---------------------------------------------------------------------------
@@ -48,6 +49,12 @@ static NSString *sDebugPath = nil;
 // Runtime-resolved property key strings (iOS 26+)
 static NSString *sKey3x4 = nil;
 static NSString *sKey1x1 = nil;
+
+// Track the identifier currently being rendered to avoid duplicates
+static NSString *sCurrentRenderingId = nil;
+
+// Cache animated artwork objects so we don't recreate on every setNowPlayingInfo call
+static NSMutableDictionary<NSString *, id> *sAnimatedArtworkCache = nil;
 
 // ---------------------------------------------------------------------------
 #pragma mark - Debug Logging
@@ -492,24 +499,97 @@ static NSURL *ensureVideo(NSString *identifier, UIImage *preview) {
 }
 
 // ---------------------------------------------------------------------------
-#pragma mark - Patching nowPlayingInfo
+#pragma mark - Animated Artwork Creation (objc_msgSend, synchronous handlers)
 // ---------------------------------------------------------------------------
 
-static NSDictionary *patchedInfo(NSDictionary *info) {
-    if (!info) return info;
-
-    // We need the runtime keys; if they were not resolved, bail
-    if (!sKey3x4 && !sKey1x1) {
-        NPFLog(@"No animated artwork keys resolved, skipping");
-        return info;
+/// Create a MPMediaItemAnimatedArtwork whose preview and video handlers
+/// return pre-rendered content IMMEDIATELY — no async dispatch, no completion
+/// delay.  Uses objc_msgSend instead of NSInvocation for clean block passing.
+static id createAnimatedArtwork(NSString *artworkID, UIImage *preview, NSURL *videoURL) {
+    Class artworkClass = NSClassFromString(@"MPMediaItemAnimatedArtwork");
+    if (!artworkClass) {
+        NPFLog(@"MPMediaItemAnimatedArtwork class not found");
+        return nil;
     }
 
-    // Don't replace if 3x4 is already set
-    if (sKey3x4 && info[sKey3x4] != nil) {
-        return info;
+    SEL initSel = NSSelectorFromString(
+        @"initWithArtworkID:previewImageRequestHandler:videoAssetFileURLRequestHandler:");
+
+    id allocated = [artworkClass alloc];
+    if (!allocated) return nil;
+
+    if (![allocated respondsToSelector:initSel]) {
+        NPFLog(@"initWithArtworkID:... selector not found");
+        return nil;
     }
 
-    // Check supportedAnimatedArtworkKeys
+    // Block types for the handlers
+    typedef void (^PreviewCompletion)(UIImage *);
+    typedef void (^VideoCompletion)(NSURL *);
+    typedef void (^PreviewHandler)(CGSize, PreviewCompletion);
+    typedef void (^VideoHandler)(CGSize, VideoCompletion);
+
+    // Capture strong references
+    UIImage *capturedPreview = preview;
+    NSURL *capturedVideoURL = [videoURL copy];
+    NSString *capturedID = [artworkID copy];
+
+    // SYNCHRONOUS preview handler — returns immediately
+    PreviewHandler previewHandler = ^(CGSize requestedSize __unused,
+                                      PreviewCompletion completion) {
+        @try {
+            NPFLog(@"Preview handler called for %@ — returning immediately", capturedID);
+            if (completion) completion(capturedPreview);
+        } @catch (NSException *e) {
+            NPFLog(@"previewHandler exception: %@", e.reason);
+            if (completion) completion(nil);
+        }
+    };
+
+    // SYNCHRONOUS video handler — returns pre-rendered URL immediately
+    VideoHandler videoHandler = ^(CGSize requestedSize __unused,
+                                  VideoCompletion completion) {
+        @try {
+            NPFLog(@"Video handler called for %@ — returning URL immediately: %@",
+                   capturedID, capturedVideoURL.lastPathComponent);
+            if (completion) completion(capturedVideoURL);
+        } @catch (NSException *e) {
+            NPFLog(@"videoHandler exception: %@", e.reason);
+            if (completion) completion(nil);
+        }
+    };
+
+    // Use objc_msgSend with proper casting for block arguments
+    // Blocks are id-compatible objects under ARC
+    typedef id (*InitAnimatedArtworkFn)(id, SEL, NSString *, id, id);
+    InitAnimatedArtworkFn initFn = (InitAnimatedArtworkFn)objc_msgSend;
+
+    id result = nil;
+    @try {
+        result = initFn(allocated, initSel, artworkID,
+                         (id)previewHandler, (id)videoHandler);
+    } @catch (NSException *e) {
+        NPFLog(@"objc_msgSend init exception: %@", e.reason);
+        return nil;
+    }
+
+    if (result) {
+        NPFLog(@"MPMediaItemAnimatedArtwork created via objc_msgSend for '%@'", artworkID);
+    }
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+#pragma mark - Patch info dictionary (only when video is READY on disk)
+// ---------------------------------------------------------------------------
+
+static NSDictionary *patchInfoWithAnimatedArtwork(NSDictionary *info,
+                                                   NSString *identifier,
+                                                   UIImage *preview,
+                                                   NSURL *videoURL) {
+    if (!sKey3x4 && !sKey1x1) return info;
+
+    // Check which keys are supported
     BOOL has3x4 = NO;
     BOOL has1x1 = NO;
 
@@ -519,207 +599,172 @@ static NSDictionary *patchedInfo(NSDictionary *info) {
 #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
         NSArray *supported = [MPNowPlayingInfoCenter performSelector:supportedSel];
 #pragma clang diagnostic pop
-        NPFLog(@"supportedAnimatedArtworkKeys: %@", supported);
-
         if (sKey3x4) has3x4 = [supported containsObject:sKey3x4];
         if (sKey1x1) has1x1 = [supported containsObject:sKey1x1];
     } else {
-        NPFLog(@"supportedAnimatedArtworkKeys not available, trying both keys");
         has3x4 = (sKey3x4 != nil);
         has1x1 = (sKey1x1 != nil);
     }
 
-    if (!has3x4 && !has1x1) {
-        NPFLog(@"No animated artwork keys supported by system");
-        return info;
-    }
+    if (!has3x4 && !has1x1) return info;
 
-    // Get the static artwork
-    MPMediaItemArtwork *artwork = info[MPMediaItemPropertyArtwork];
-    if (![artwork isKindOfClass:[MPMediaItemArtwork class]]) {
-        NPFLog(@"No MPMediaItemArtwork in nowPlayingInfo");
-        return info;
-    }
-
-    NSString *artist = info[MPMediaItemPropertyArtist] ?: @"(unknown)";
-    NSString *title  = info[MPMediaItemPropertyTitle] ?: @"(unknown)";
-    NPFLog(@"Patching info for: %@ - %@", artist, title);
-
-    NSString *identifier = artworkIdentifier(info);
-
-    UIImage *preview = cachedPreview(identifier, artwork);
-    if (!preview) {
-        NPFLog(@"Could not create preview, skipping");
-        return info;
-    }
-
-    // === Everything below touches runtime-resolved classes/selectors.
-    //     Wrap in @try/@catch so a framework change never crashes the app.
-    @try {
-
-    // Create MPMediaItemAnimatedArtwork using runtime
-    Class artworkClass = NSClassFromString(@"MPMediaItemAnimatedArtwork");
-    if (!artworkClass) {
-        NPFLog(@"MPMediaItemAnimatedArtwork class not found");
-        return info;
-    }
-
-    SEL initSel = NSSelectorFromString(
-        @"initWithArtworkID:previewImageRequestHandler:videoAssetFileURLRequestHandler:");
-
-    // Define block types matching the spotifyglass pattern:
-    // previewImageRequestHandler: (void (^)(CGSize requestedSize, void (^completion)(UIImage *)))
-    // videoAssetFileURLRequestHandler: (void (^)(CGSize requestedSize, void (^completion)(NSURL *)))
-    typedef void (^PreviewCompletion)(UIImage *);
-    typedef void (^VideoCompletion)(NSURL *);
-    typedef void (^PreviewHandler)(CGSize requestedSize, PreviewCompletion completion);
-    typedef void (^VideoHandler)(CGSize requestedSize, VideoCompletion completion);
-
-    // Capture identifier and preview for use in blocks
-    NSString *capturedId = [identifier copy];
-    UIImage *capturedPreview = preview;
-
-    PreviewHandler previewHandler = ^(CGSize requestedSize __unused,
-                                      PreviewCompletion completion) {
-        @try {
-            NPFLog(@"Preview requested for %@", capturedId);
-            if (completion) {
-                completion(capturedPreview);
-            }
-        } @catch (NSException *e) {
-            NPFLog(@"CRASH in previewHandler: %@ — %@", e.name, e.reason);
-            if (completion) completion(nil);
-        }
-    };
-
-    VideoHandler videoHandler = ^(CGSize requestedSize __unused,
-                                  VideoCompletion completion) {
-        @try {
-            NPFLog(@"Video requested for %@", capturedId);
-            if (!completion) return;
-            if (!capturedPreview) {
-                NPFLog(@"capturedPreview is nil, cannot render video");
-                completion(nil);
-                return;
-            }
-            dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-                @try {
-                    NSURL *videoURL = ensureVideo(capturedId, capturedPreview);
-                    NPFLog(@"Video completion callback, url=%@", videoURL);
-                    completion(videoURL);
-                } @catch (NSException *e) {
-                    NPFLog(@"CRASH in videoHandler background: %@ — %@", e.name, e.reason);
-                    completion(nil);
-                }
-            });
-        } @catch (NSException *e) {
-            NPFLog(@"CRASH in videoHandler: %@ — %@", e.name, e.reason);
-            if (completion) completion(nil);
-        }
-    };
-
-    // Use objc_msgSend to call the init method with the blocks
-    // We need to cast objc_msgSend to the correct function pointer type
-    id artwork3x4 = nil;
-    {
-        id allocated = [artworkClass alloc];
-        if (!allocated) {
-            NPFLog(@"Failed to alloc MPMediaItemAnimatedArtwork");
-            return info;
-        }
-
-        // Build NSInvocation for the init
-        NSMethodSignature *sig = [allocated methodSignatureForSelector:initSel];
-        if (!sig) {
-            NPFLog(@"initWithArtworkID:... method signature not found");
-            return info;
-        }
-
-        NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-        [inv retainArguments]; // Retain/copy blocks and object args
-        [inv setTarget:allocated];
-        [inv setSelector:initSel];
-
-        NSString *artworkID3x4 = capturedId;
-        [inv setArgument:&artworkID3x4 atIndex:2];
-        [inv setArgument:&previewHandler atIndex:3];
-        [inv setArgument:&videoHandler atIndex:4];
-        [inv invoke];
-
-        // SAFE pattern: getReturnValue: writes an unretained pointer.
-        // Using __bridge_transfer on it risks a double-free when
-        // NSInvocation also releases internally.  Read into an
-        // __unsafe_unretained temp and let ARC retain via strong assign.
-        __unsafe_unretained id tempResult3x4 = nil;
-        [inv getReturnValue:&tempResult3x4];
-        artwork3x4 = tempResult3x4;
-    }
-
-    if (!artwork3x4) {
-        NPFLog(@"MPMediaItemAnimatedArtwork init returned nil");
-        return info;
-    }
-    NPFLog(@"MPMediaItemAnimatedArtwork created (3x4)");
-
-    // Create a 1x1 variant
-    id artwork1x1 = nil;
-    {
-        id allocated = [artworkClass alloc];
-        if (allocated) {
-            NSMethodSignature *sig = [allocated methodSignatureForSelector:initSel];
-            if (sig) {
-                NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-                [inv retainArguments]; // Retain/copy blocks and object args
-                [inv setTarget:allocated];
-                [inv setSelector:initSel];
-
-                NSString *artworkID1x1 = [capturedId stringByAppendingString:@"_1x1"];
-                [inv setArgument:&artworkID1x1 atIndex:2];
-                [inv setArgument:&previewHandler atIndex:3];
-                [inv setArgument:&videoHandler atIndex:4];
-                [inv invoke];
-
-                // SAFE pattern — same as 3x4 above
-                __unsafe_unretained id tempResult1x1 = nil;
-                [inv getReturnValue:&tempResult1x1];
-                artwork1x1 = tempResult1x1;
-            }
-        }
-    }
-
-    // Build the patched dictionary
     NSMutableDictionary *patched = [info mutableCopy];
-    if (has3x4 && sKey3x4 && artwork3x4) {
-        patched[sKey3x4] = artwork3x4;
-    }
-    if (has1x1 && sKey1x1 && artwork1x1) {
-        patched[sKey1x1] = artwork1x1;
-    }
 
-    NPFLog(@"Set 3x4: %d, 1x1: %d", has3x4 && artwork3x4 != nil, has1x1 && artwork1x1 != nil);
-    return [patched copy];
+    @try {
+        // Check cache first
+        NSString *cacheKey3x4 = identifier;
+        NSString *cacheKey1x1 = [identifier stringByAppendingString:@"_1x1"];
 
+        id artwork3x4 = sAnimatedArtworkCache[cacheKey3x4];
+        id artwork1x1 = sAnimatedArtworkCache[cacheKey1x1];
+
+        // Create if not cached
+        if (!artwork3x4 && has3x4) {
+            artwork3x4 = createAnimatedArtwork(cacheKey3x4, preview, videoURL);
+            if (artwork3x4) sAnimatedArtworkCache[cacheKey3x4] = artwork3x4;
+        }
+        if (!artwork1x1 && has1x1) {
+            artwork1x1 = createAnimatedArtwork(cacheKey1x1, preview, videoURL);
+            if (artwork1x1) sAnimatedArtworkCache[cacheKey1x1] = artwork1x1;
+        }
+
+        if (has3x4 && sKey3x4 && artwork3x4) patched[sKey3x4] = artwork3x4;
+        if (has1x1 && sKey1x1 && artwork1x1) patched[sKey1x1] = artwork1x1;
+
+        NPFLog(@"Patched with animated artwork: 3x4=%d 1x1=%d (video=%@)",
+               artwork3x4 != nil, artwork1x1 != nil, videoURL.lastPathComponent);
     } @catch (NSException *e) {
-        NPFLog(@"CRASH in patchedInfo runtime section: %@ — %@", e.name, e.reason);
-        return info;  // fall back to unpatched
+        NPFLog(@"Exception in patchInfoWithAnimatedArtwork: %@", e.reason);
+        return info;
     }
+
+    return [patched copy];
 }
 
 // ---------------------------------------------------------------------------
-#pragma mark - Swizzled IMP
+#pragma mark - Swizzled IMP (pre-render strategy)
 // ---------------------------------------------------------------------------
 
 static void hooked_setNowPlayingInfo(id self, SEL _cmd, NSDictionary *info) {
     @try {
-        NSDictionary *patched = patchedInfo(info);
-        if (sOriginalIMP) {
-            sOriginalIMP(self, _cmd, patched ?: info);
+        if (!info || (!sKey3x4 && !sKey1x1)) {
+            if (sOriginalIMP) sOriginalIMP(self, _cmd, info);
+            return;
+        }
+
+        // If 3x4 is already set by the app itself, don't touch
+        if (sKey3x4 && info[sKey3x4] != nil) {
+            if (sOriginalIMP) sOriginalIMP(self, _cmd, info);
+            return;
+        }
+
+        // Get cover artwork
+        MPMediaItemArtwork *artwork = info[MPMediaItemPropertyArtwork];
+        if (![artwork isKindOfClass:[MPMediaItemArtwork class]]) {
+            if (sOriginalIMP) sOriginalIMP(self, _cmd, info);
+            return;
+        }
+
+        NSString *identifier = artworkIdentifier(info);
+        NSString *artist = info[MPMediaItemPropertyArtist] ?: @"?";
+        NSString *title  = info[MPMediaItemPropertyTitle] ?: @"?";
+
+        // Get/create the preview image
+        UIImage *preview = cachedPreview(identifier, artwork);
+        if (!preview) {
+            NPFLog(@"No preview for %@ - %@, passing through", artist, title);
+            if (sOriginalIMP) sOriginalIMP(self, _cmd, info);
+            return;
+        }
+
+        // Check if the video is ALREADY on disk
+        NSURL *videoURL = videoURLForIdentifier(identifier);
+        BOOL videoReady = [[NSFileManager defaultManager] fileExistsAtPath:videoURL.path];
+
+        if (videoReady) {
+            // === FAST PATH: video exists, patch immediately ===
+            NPFLog(@"Video ready for %@ - %@, patching NOW", artist, title);
+            NSDictionary *patched = patchInfoWithAnimatedArtwork(
+                info, identifier, preview, videoURL);
+            if (sOriginalIMP) sOriginalIMP(self, _cmd, patched);
+        } else {
+            // === SLOW PATH: pass original through, render in background,
+            //     then re-trigger setNowPlayingInfo via original IMP ===
+            NPFLog(@"Video NOT ready for %@ - %@, rendering in background...",
+                   artist, title);
+            if (sOriginalIMP) sOriginalIMP(self, _cmd, info);
+
+            // Only start one render per identifier
+            [sLock lock];
+            BOOL alreadyRendering = [sCurrentRenderingId isEqualToString:identifier];
+            if (!alreadyRendering) {
+                sCurrentRenderingId = [identifier copy];
+            }
+            [sLock unlock];
+
+            if (!alreadyRendering) {
+                NSString *capturedId = [identifier copy];
+                UIImage *capturedPreview = preview;
+
+                dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                    NPFLog(@"Background render START for %@", capturedId);
+                    NSURL *renderedURL = videoURLForIdentifier(capturedId);
+                    BOOL ok = renderVideo(capturedPreview,
+                                          CGSizeMake(kVideoWidth, kVideoHeight),
+                                          renderedURL);
+
+                    [sLock lock];
+                    if ([sCurrentRenderingId isEqualToString:capturedId]) {
+                        sCurrentRenderingId = nil;
+                    }
+                    [sLock unlock];
+
+                    if (!ok) {
+                        NPFLog(@"Background render FAILED for %@", capturedId);
+                        return;
+                    }
+
+                    NPFLog(@"Background render DONE for %@, re-triggering", capturedId);
+                    pruneVideoCache();
+
+                    // Re-trigger on main queue: get current info, patch it,
+                    // call original IMP directly (no hook recursion)
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        @try {
+                            MPNowPlayingInfoCenter *center =
+                                [MPNowPlayingInfoCenter defaultCenter];
+                            NSDictionary *current = [center nowPlayingInfo];
+                            if (!current) {
+                                NPFLog(@"No current info on re-trigger, skipping");
+                                return;
+                            }
+
+                            // Verify same track is still playing
+                            NSString *currentId = artworkIdentifier(current);
+                            if (![currentId isEqualToString:capturedId]) {
+                                NPFLog(@"Track changed during render, skipping re-trigger");
+                                return;
+                            }
+
+                            UIImage *currentPreview = cachedPreview(capturedId, nil);
+                            if (!currentPreview) currentPreview = capturedPreview;
+
+                            NSDictionary *patched = patchInfoWithAnimatedArtwork(
+                                current, capturedId, currentPreview, renderedURL);
+
+                            NPFLog(@"Re-triggering setNowPlayingInfo via original IMP");
+                            SEL sel = NSSelectorFromString(@"setNowPlayingInfo:");
+                            sOriginalIMP(center, sel, patched);
+                        } @catch (NSException *e) {
+                            NPFLog(@"Exception in re-trigger: %@", e.reason);
+                        }
+                    });
+                });
+            }
         }
     } @catch (NSException *e) {
-        NPFLog(@"CRASH CAUGHT in hooked_setNowPlayingInfo: %@ — %@", e.name, e.reason);
-        if (sOriginalIMP) {
-            sOriginalIMP(self, _cmd, info);  // fall back to unpatched original
-        }
+        NPFLog(@"CRASH in hooked_setNowPlayingInfo: %@ — %@", e.name, e.reason);
+        if (sOriginalIMP) sOriginalIMP(self, _cmd, info);
     }
 }
 
@@ -837,6 +882,7 @@ static void npa_constructor(void) {
     sLock = [[NSLock alloc] init];
     sPreviewCache = [NSMutableDictionary dictionary];
     sRenderingSet = [NSMutableSet set];
+    sAnimatedArtworkCache = [NSMutableDictionary dictionary];
 
     // Set up debug breadcrumb file
     sDebugPath = [NSTemporaryDirectory()
